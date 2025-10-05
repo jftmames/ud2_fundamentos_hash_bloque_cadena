@@ -127,14 +127,12 @@ def total_stake():
     return sum(v["stake"] for v in st.session_state.validators)
 
 def pos_header(index: int, timestamp_iso: str, data: str, prev_hash: str) -> str:
-    """Cabecera firmada en PoS (nonce fijo 0 para simplificar)."""
     return f"{index}|{timestamp_iso}|{data}|{prev_hash}|0"
 
 def pos_hmac(header: str, secret_hex: str) -> str:
     return hmac.new(bytes.fromhex(secret_hex), header.encode("utf-8"), hashlib.sha256).hexdigest()
 
 def pos_select_signers(threshold_frac: float):
-    """Selecciona validadores por stake descendente hasta cubrir el umbral."""
     vals = sorted(st.session_state.validators, key=lambda x: -x["stake"])
     need = threshold_frac * total_stake()
     got = 0
@@ -147,7 +145,6 @@ def pos_select_signers(threshold_frac: float):
     return chosen, got
 
 def pos_sign_block(index: int, timestamp_iso: str, data: str, prev_hash: str, threshold_frac: float):
-    """Devuelve (signers_ids, stake_signed, signatures_dict)."""
     header = pos_header(index, timestamp_iso, data, prev_hash)
     chosen, got = pos_select_signers(threshold_frac)
     sigs = {v["id"]: pos_hmac(header, v["secret"]) for v in chosen}
@@ -179,7 +176,7 @@ ensure_validators()
 # ---------------------------
 if "s1_text" not in st.session_state:
     r = tx_df.iloc[0]
-    st.session_state.s1_text = f"{int(r['id'])}: {r['descripcion']} — {float(r['importe']):.2f} EUR"
+    st.session_state["s1_text"] = f"{int(r['id'])}: {r['descripcion']} — {float(r['importe']):.2f} EUR"
 
 if "chain" not in st.session_state:
     genesis = {
@@ -200,6 +197,19 @@ if "chain" not in st.session_state:
 
 if "consensus_mode" not in st.session_state:
     st.session_state.consensus_mode = "PoW-lite"
+
+# ---------------------------
+# Callbacks (evitan asignar después de instanciar widgets)
+# ---------------------------
+def cb_load_selection():
+    pick = st.session_state["s1_pick"]
+    r = tx_df[tx_df["id"] == pick].iloc[0]
+    st.session_state["s1_text"] = f"{int(r['id'])}: {r['descripcion']} — {float(r['importe']):.2f} EUR"
+    st.session_state.pop("s1_mined", None)
+
+def cb_alter_text():
+    st.session_state["s1_text"] = alter_one_char(st.session_state["s1_text"])
+    st.session_state.pop("s1_mined", None)
 
 # ---------------------------
 # Encabezado
@@ -264,21 +274,20 @@ with tabs[1]:
 
     with left:
         st.markdown("#### 2.1 Dato base (puedes editarlo)")
-        pick = st.selectbox(
+        st.selectbox(
             "Cargar desde dataset demo:",
             options=tx_df["id"].tolist(),
-            format_func=lambda i: f"ID {i} — {tx_df[tx_df['id']==i]['descripcion'].values[0]}"
+            format_func=lambda i: f"ID {i} — {tx_df[tx_df['id']==i]['descripcion'].values[0]}",
+            key="s1_pick",
         )
-        if st.button("📥 Cargar selección"):
-            r = tx_df[tx_df["id"] == pick].iloc[0]
-            st.session_state.s1_text = f"{int(r['id'])}: {r['descripcion']} — {float(r['importe']):.2f} EUR"
+        st.button("📥 Cargar selección", on_click=cb_load_selection)
+        st.button("🔁 Alterar 1 carácter", on_click=cb_alter_text)
 
+        # El widget se instancia después de los botones/callbacks → sin excepciones
         st.text_area("Dato (editable):", key="s1_text", height=100)
-        if st.button("🔁 Alterar 1 carácter"):
-            st.session_state.s1_text = alter_one_char(st.session_state.s1_text)
 
         st.markdown("#### 2.2 Hash simple (sin nonce)")
-        st.code(sha256_hex(st.session_state.s1_text))
+        st.code(sha256_hex(st.session_state["s1_text"]))
 
     with right:
         st.markdown("#### 2.3 Prueba de trabajo (lite)")
@@ -288,11 +297,11 @@ with tabs[1]:
         prev = "x" * 64  # en S1 no encadenamos; sólo demostración PoW
 
         if st.button("⛏️ Minar (encontrar nonce)"):
-            nonce, h, iters, secs = mine_nonce(idx, ts, st.session_state.s1_text, prev, difficulty)
+            nonce, h, iters, secs = mine_nonce(idx, ts, st.session_state["s1_text"], prev, difficulty)
             if nonce is not None:
                 st.success(f"Nonce: {nonce} · Hash: {h[:20]}... · Intentos: {iters:,} · Tiempo: {secs:.2f}s")
-                st.session_state.s1_mined = {
-                    "index": idx, "timestamp": ts, "data": st.session_state.s1_text,
+                st.session_state["s1_mined"] = {
+                    "index": idx, "timestamp": ts, "data": st.session_state["s1_text"],
                     "prev_hash": prev, "nonce": nonce, "hash": h,
                     "difficulty": difficulty, "iters": iters, "secs": secs
                 }
@@ -342,8 +351,7 @@ with tabs[2]:
                 prev_block = st.session_state.chain[-1]
                 idx = prev_block["index"] + 1
                 ts2 = now_iso()
-                # nonce fijo 0 en PoS simulado
-                h = block_hash(idx, ts2, data_input, prev_block["hash"], 0)
+                h = block_hash(idx, ts2, data_input, prev_block["hash"], 0)  # nonce 0 en PoS simulado
                 signers, signed_stake, sigs = pos_sign_block(idx, ts2, data_input, prev_block["hash"], pos_thr)
                 if signed_stake >= pos_thr * total_stake():
                     new_block = {
@@ -364,30 +372,24 @@ with tabs[2]:
             target = st.selectbox("Elegir bloque a alterar (≠ génesis)", options=choices)
             new_text = st.text_area("Nuevo dato para el bloque elegido:", height=80, key="s2_newdata")
             if st.button("✏️ Alterar dato del bloque"):
-                # Modifica dato y reencadena sin re-minar/firmar
                 start_idx = None
                 for i, b in enumerate(st.session_state.chain):
                     if b["index"] == target:
                         st.session_state.chain[i]["data"] = new_text or alter_one_char(b["data"])
-                        # Recalcula hash con mismo nonce (PoW) o 0 (PoS)
-                        if b["mode"] == "pow":
-                            n = st.session_state.chain[i]["nonce"]
-                        else:
-                            n = 0
-                            st.session_state.chain[i]["pos_signers"] = []
-                            st.session_state.chain[i]["pos_signed_stake"] = 0
+                        n = st.session_state.chain[i]["nonce"] if b["mode"] == "pow" else 0
+                        st.session_state.chain[i]["pos_signers"] = [] if b["mode"] == "pos" else b.get("pos_signers", [])
+                        st.session_state.chain[i]["pos_signed_stake"] = 0 if b["mode"] == "pos" else b.get("pos_signed_stake", 0)
                         st.session_state.chain[i]["hash"] = block_hash(
                             b["index"], b["timestamp"], st.session_state.chain[i]["data"], b["prev_hash"], n
                         )
                         start_idx = i + 1
                         break
                 if start_idx is not None:
-                    # Propaga cambios hacia delante (sin re-minar/revalidar)
                     for j in range(start_idx, len(st.session_state.chain)):
                         prev_h = st.session_state.chain[j-1]["hash"]
                         st.session_state.chain[j]["prev_hash"] = prev_h
                         if st.session_state.chain[j]["mode"] == "pow":
-                            n = st.session_state.chain[j]["nonce"]  # mantiene nonce ⇒ probablemente inválido
+                            n = st.session_state.chain[j]["nonce"]
                         else:
                             n = 0
                             st.session_state.chain[j]["pos_signers"] = []
@@ -401,7 +403,6 @@ with tabs[2]:
                         )
                     st.warning("Bloque alterado. La cadena puede estar **inválida** hasta re-minar (PoW) o revalidar (PoS).")
 
-            # Re-minar/revalidar desde el bloque seleccionado, respetando el modo de cada bloque
             if st.button("🔁 Reparar desde ese bloque (re-minado/revalidación)"):
                 for j in range(len(st.session_state.chain)):
                     if st.session_state.chain[j]["index"] == target:
@@ -411,10 +412,9 @@ with tabs[2]:
                     prev_h = st.session_state.chain[j-1]["hash"] if j > 0 else "0"*64
                     b = st.session_state.chain[j]
                     idx = b["index"]
-                    ts3 = b["timestamp"]  # mantenemos timestamp
+                    ts3 = b["timestamp"]
                     data3 = b["data"]
                     if b["mode"] == "pow":
-                        # usa dificultad histórica del bloque si existe; por defecto 3
                         diff = b.get("difficulty") or 3
                         nonce, h, iters, secs = mine_nonce(idx, ts3, data3, prev_h, diff)
                         if nonce is None:
@@ -432,7 +432,6 @@ with tabs[2]:
                         b["prev_hash"], b["nonce"], b["hash"] = prev_h, 0, h
                         b["pos_signers"], b["pos_threshold"], b["pos_signed_stake"] = signers, float(thr), int(signed_stake)
                     else:
-                        # génesis
                         b["prev_hash"] = prev_h
                         b["hash"] = block_hash(idx, ts3, data3, prev_h, b["nonce"])
                 else:
@@ -456,17 +455,13 @@ with tabs[3]:
     problems = []
     ok = True
 
-    # Validación de enlace
+    # Validación de enlace + hash coherente
     for i, b in enumerate(st.session_state.chain):
-        # Recalcula hash esperado
         expected = block_hash(b["index"], b["timestamp"], b["data"], b["prev_hash"], b["nonce"])
         if expected != b["hash"]:
             ok = False
             problems.append(f"Bloque {b['index']}: hash no corresponde a sus campos.")
-        if i == 0:
-            continue
-        prev_ok = (b["prev_hash"] == st.session_state.chain[i-1]["hash"])
-        if not prev_ok:
+        if i > 0 and b["prev_hash"] != st.session_state.chain[i-1]["hash"]:
             ok = False
             problems.append(f"Bloque {b['index']}: prev_hash no coincide con el hash del anterior.")
 
@@ -484,7 +479,7 @@ with tabs[3]:
             signed = stake_of(b.get("pos_signers", []))
             if signed < thr * total_stake():
                 ok = False
-                problems.append(f"Bloque {b['index']} (PoS): stake firmado {signed} < umbral {thr*total_stake():.0f}.")
+                problems.append(f"Bloque {b['index']} (PoS): stake firmado {signed} < umbral {int(thr*total_stake())}.")
 
     if ok:
         st.success("✅ Cadena válida (enlace correcto y reglas de consenso satisfechas por bloque).")
@@ -658,3 +653,4 @@ with tabs[5]:
 
     st.markdown("---")
     st.caption("Rúbrica general: precisión técnica (40%), claridad (30%), aplicación/ejemplo (30%).")
+
